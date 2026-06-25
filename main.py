@@ -2,12 +2,21 @@ import gzhu
 import os
 import configparser
 import time
+import threading
 import concurrent.futures
 from datetime import datetime
 
 
+# 跳过容量检查的板块列表，可在配置文件中用 skipcapacity 自定义（逗号分隔）
+SKIP_CAPACITY_BLOCKS = ['通识']
+
+# 请求间隔（秒），可在配置文件中用 requestinterval 自定义
+REQUEST_INTERVAL = 0.5
+
+
 class Config(object):
     def __init__(self):
+        global SKIP_CAPACITY_BLOCKS, REQUEST_INTERVAL
         self.config_ini = configparser.ConfigParser()
         self.file_path = os.path.join(os.path.abspath('.'), '配置信息.ini')
         self.config_ini.read(self.file_path, encoding='utf-8')
@@ -16,6 +25,18 @@ class Config(object):
         self.username = base_info['username']
         self.password = base_info['password']
         self.startTime = base_info['starttime']
+
+        # 从配置文件读取跳过容量检查的板块
+        skipcapacity = base_info.get('skipcapacity', '通识')
+        SKIP_CAPACITY_BLOCKS = [b.strip() for b in skipcapacity.split(',') if b.strip()]
+
+        # 从配置文件读取请求间隔（秒），默认 0.5s
+        request_interval = base_info.get('requestinterval', '0.5')
+        try:
+            REQUEST_INTERVAL = float(request_interval)
+        except ValueError:
+            REQUEST_INTERVAL = 0.5
+        print('请求间隔: {}s'.format(REQUEST_INTERVAL))
 
         # 将三个字典的值str->list
         self.mode1 = self.re_flash('mode1')
@@ -37,6 +58,16 @@ class Config(object):
         self.config_ini.set('baseinfo', 'username', un)
         self.config_ini.set('baseinfo', 'password', pw)
 
+        sk = input('输入跳过容量检查的板块(逗号分隔, 如 通识,其他特殊课程, 回车默认为"通识") > ').strip()
+        if sk == '':
+            sk = '通识'
+        self.config_ini.set('baseinfo', 'skipcapacity', sk)
+
+        ri = input('输入请求间隔秒数(默认0.5s, 越小越快但更容易被限流) > ').strip()
+        if ri == '':
+            ri = '0.5'
+        self.config_ini.set('baseinfo', 'requestinterval', ri)
+
         while True:
             md = input(' 1 - 自动抢课\n 2 - 捡漏模式\n 3 - 替换模式\n 输入你使用的模式前面的数字代号 > ')
             if md in '123':
@@ -53,7 +84,7 @@ class Config(object):
                 print('目前正在设置第{}个替换设置'.format(i))
                 jxb_old = input('输入你已选的教学班号(要退的) > ').strip()
                 jxb_new = input('输入你想换成的教学班号 > ').strip()
-                bl = input('输入该教学班对应的板块:主修/体育/通识  (输入中文文字) > ').strip()
+                bl = input('输入该教学班对应的板块(输入Tab标签上的文字, 如 主修课程/通识选修 等) > ').strip()
                 self.config_ini.set(md, str(i), '{},{},{}'.format(jxb_old, jxb_new, bl))
 
                 end_mark = input('输入0结束录入, 输入其他继续录入 > ')
@@ -65,7 +96,7 @@ class Config(object):
             while True:
                 print('目前正在设置第{}个教学班设置'.format(i))
                 jxb = input('输入你要选的教学班号 > ').strip()  # 去掉前后空格
-                bl = input('输入该教学班对应的板块:主修/体育/通识  (输入中文文字) > ').strip()
+                bl = input('输入该教学班对应的板块(输入Tab标签上的文字, 如 主修课程/通识选修 等) > ').strip()
                 yxj = input('输入优先级(数字越小优先级越高, 回车默认为1) > ').strip()
                 if yxj == '':
                     yxj = '1'
@@ -149,69 +180,98 @@ def xuanke1(xuanke_data: dict):
     if g.xuan_ke():
         daixuan_info = get_daixuan_info(xuanke_data=xuanke_data)
 
-        # 按优先级分组（数字越小优先级越高）
-        priority_groups = {}
-        for item in daixuan_info:
-            p = item.get('priority', 1)
-            if p not in priority_groups:
-                priority_groups[p] = []
-            priority_groups[p].append(item)
+        # 按优先级排序（数字越小优先级越高），保持列表有序
+        daixuan_info.sort(key=lambda x: x.get('priority', 1))
+
+        # 请求间隔锁，确保并发请求之间有时间间隔
+        interval_lock = threading.Lock()
+        last_request_time = [0.0]  # 用列表包装以便在闭包中修改
 
         try_time = 1
-        for priority in sorted(priority_groups.keys()):
-            group = priority_groups[priority]
+        while True:
+            # 收集所有优先级中仍需处理的条目（排除已成功和已满员）
+            pending = [
+                item for item in daixuan_info
+                if item['success'] is not True
+                and item.get('msg', '') not in ('已满', '已满，等待降级到低优先级')
+            ]
 
-            while True:
-                # 当前优先级中仍需处理的条目（排除已成功和已标记满员待降级的）
-                pending = [
-                    item for item in group
-                    if item['success'] is not True
-                    and item.get('msg', '') != '已满，等待降级到低优先级'
-                ]
+            if not pending:
+                break
 
-                if not pending:
-                    break
+            # 按课程名称分组，每组内按优先级排序（数字越小优先级越高）
+            course_groups = {}  # {course_name: [item, ...]}
+            for item in pending:
+                cn = item.get('course_name', '')
+                if cn not in course_groups:
+                    course_groups[cn] = []
+                course_groups[cn].append(item)
+            for cn in course_groups:
+                course_groups[cn].sort(key=lambda x: x.get('priority', 1))
 
-                print(''.center(30, '='))
-                print('{time}  优先级{pri} 第{tt}次轮询'.format(
-                    time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    pri=priority, tt=try_time))
+            # 构建本轮并发池：
+            # 同名课程中，只取最高优先级入池；低优先级等下一轮
+            # 并发池不设上限，所有课程的优先级1同时入池
+            pool_items = []   # 本轮进入并发池的条目
+            waiting_items = []  # 本轮等待的同名低优先级条目
+            for cn, items in course_groups.items():
+                pool_items.append(items[0])          # 每门课最高优先级必入池
+                for item in items[1:]:
+                    waiting_items.append(item)       # 低优先级等待下一轮
 
-                def submit_one(item):
-                    if item['course_name'] == '':
-                        item['msg'] = '教学班号:{}查找无结果'.format(item['kch_id'])
-                        return item, False
+            priority_set = sorted(set(item.get('priority', 1) for item in pool_items))
+            print(''.center(30, '='))
+            print('{time}  第{tt}次轮询  待处理:{n}门课(本轮入池:{p}门, 请求间隔:{iv}s)  涉及优先级:{pri}'.format(
+                time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                tt=try_time, n=len(pending), p=len(pool_items), iv=REQUEST_INTERVAL, pri=priority_set))
+            if waiting_items:
+                wait_names = set(item.get('course_name', '') for item in waiting_items)
+                print('  等待中的同名低优先级课程: {names}'.format(names=wait_names))
+
+            def submit_one(item):
+                if item['course_name'] == '':
+                    item['msg'] = '教学班号:{}查找无结果'.format(item['kch_id'])
+                    return item, False
+                if item['success'] is True:
+                    return item, True
+                # 请求间隔控制：获取锁，等待+占位，确保同一时间只有一个请求发出
+                with interval_lock:
+                    elapsed = time.time() - last_request_time[0]
+                    if elapsed < REQUEST_INTERVAL:
+                        time.sleep(REQUEST_INTERVAL - elapsed)
+                    # 立即更新时间戳占位，防止其他线程同时发请求
+                    last_request_time[0] = time.time()
+                if (item['totalResult'] < item['jxbrl']) or any(b in item.get('block', '') for b in SKIP_CAPACITY_BLOCKS):
+                    status, msg = g.post_do_jxb(item)
+                    item['success'] = status
+                    item['msg'] = msg
+                    return item, status
+                else:
+                    item['msg'] = '已满'
+                    return item, False
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(pool_items)) as executor:
+                futures = [executor.submit(submit_one, item) for item in pool_items]
+                for future in concurrent.futures.as_completed(futures):
+                    item, status = future.result()
+                    pri = item.get('priority', 1)
                     if item['success'] is True:
-                        return item, True
-                    if (item['totalResult'] < item['jxbrl']) or ('通识' in item['block']):
-                        status, msg = g.post_do_jxb(item)
-                        item['success'] = status
-                        item['msg'] = msg
-                        return item, status
+                        print('{time}  {cn}(优先级{pri})选课成功'.format(
+                            time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                            cn=item['course_name'], pri=pri))
+                    elif item.get('msg') == '已满':
+                        print('{cn}(优先级{pri})已满，不再尝试'.format(
+                            cn=item['course_name'], pri=pri))
                     else:
-                        item['success'] = True
-                        item['msg'] = '已满，等待降级到低优先级'
-                        return item, False
+                        if item.get('msg') == '一门课程只能选一个教学班，不可再选！':
+                            item['success'] = True
+                        print('{time}  {cn}(优先级{pri})选课失败  原因：{msg}'.format(
+                            time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                            cn=item['course_name'], pri=pri,
+                            msg=item.get('msg', '')))
 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=len(pending)) as executor:
-                    futures = [executor.submit(submit_one, item) for item in pending]
-                    for future in concurrent.futures.as_completed(futures):
-                        item, status = future.result()
-                        if item['success'] is True and item.get('msg') != '已满，等待降级到低优先级':
-                            print('{time}  {cn}选课成功'.format(
-                                time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                                cn=item['course_name']))
-                        elif item.get('msg') == '已满，等待降级到低优先级':
-                            print('{cn}已满，等待降级到低优先级'.format(cn=item['course_name']))
-                        else:
-                            if item.get('msg') == '一门课程只能选一个教学班，不可再选！':
-                                item['success'] = True
-                            print('{time}  {cn}选课失败  原因：{msg}'.format(
-                                time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                                cn=item['course_name'], msg=item.get('msg', '')))
-
-                time.sleep(10)
-                try_time += 1
+            time.sleep(10)
+            try_time += 1
 
         print('全部选课完成'.center(30, '='))
         print_data(daixuan_info)
@@ -325,7 +385,7 @@ def xuanke3(xuanke_data: dict):
             jxbrl = new_data.get('jxbrl', 0)
 
             # 检查新课是否有空位
-            if (total < jxbrl) or ('通识' in task['block']):
+            if (total < jxbrl) or any(b in task.get('block', '') for b in SKIP_CAPACITY_BLOCKS):
                 print('目标教学班{}有空位({}/{})，开始替换...'.format(
                     new_data.get('course_name', ''), total, jxbrl))
 
@@ -413,15 +473,19 @@ if __name__ == '__main__':
                 # g.xuan_ke() 执行各种初始化操作，但这需要选课系统的开放。
                 print('\n登录成功!当前用户为{un}'.format(un=config.username))
                 while True:
-                    print('1：自动抢课\n2：捡漏模式（推荐）\n3：替换模式\n99：返回主界面')
+                    print('1：自动抢课\n2：捡漏模式\n3：替换模式\n99：返回主界面')
                     choice_xuanke = input('请输入选课模式,按回车确定 > ')
                     if choice_xuanke == '1':
-                        import schedule
-                        schedule.every().day.at(config.startTime).do(xuanke1, xuanke_data=config.mode1)
-                        print('已设定于{}开始抢课'.format(config.startTime))
-                        while True:
-                            schedule.run_pending()
-                            time.sleep(5)
+                        if config.startTime.lower() == 'false':
+                            print('starttime=false，立即开始抢课'.center(30, '='))
+                            xuanke1(xuanke_data=config.mode1)
+                        else:
+                            import schedule
+                            schedule.every().day.at(config.startTime).do(xuanke1, xuanke_data=config.mode1)
+                            print('已设定于{}开始抢课'.format(config.startTime))
+                            while True:
+                                schedule.run_pending()
+                                time.sleep(5)
 
                     elif choice_xuanke == '2':
                         if g.xuan_ke():
