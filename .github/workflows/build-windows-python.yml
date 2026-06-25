@@ -1,0 +1,78 @@
+name: build-windows-python
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Windows ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            python-arch: x64
+            python-version: '3.10'
+            runner: windows-latest
+            artifact-name: Course-Bullying-in-GZHU-windows-amd64
+          - arch: arm64
+            python-arch: arm64
+            python-version: '3.10'
+            runner: windows-11-arm
+            artifact-name: Course-Bullying-in-GZHU-windows-arm64
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          architecture: ${{ matrix.python-arch }}
+
+      - name: Upgrade pip
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+
+      - name: Install dependencies for build
+        run: |
+          # lxml 在 Windows ARM64 上使用较新的版本更容易获得可用 wheel。
+          python -m pip install requests==2.26.0 schedule==1.1.0 PyExecJS==1.5.1 "lxml>=5.2.1" pyinstaller
+
+      - name: Build executable with PyInstaller
+        run: |
+          python -m PyInstaller --noconfirm --clean --console --onefile --name Course-Bullying-in-GZHU `
+            --collect-submodules lxml `
+            --collect-submodules execjs `
+            --hidden-import lxml.etree `
+            --hidden-import lxml._elementpath `
+            main.py
+
+      - name: Prepare package files
+        run: |
+          $packageDir = "package/${{ matrix.artifact-name }}"
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          Copy-Item "dist/Course-Bullying-in-GZHU.exe" "$packageDir/Course-Bullying-in-GZHU.exe"
+          Copy-Item "配置信息.ini" "$packageDir/配置信息.ini"
+          if (Test-Path "README.md") {
+            Copy-Item "README.md" "$packageDir/README.md"
+          }
+          @(
+            '运行说明：'
+            '1. 首次运行前请先安装 Node.js；PyExecJS 在运行时需要 JavaScript Runtime。'
+            '2. 启动前请先编辑同目录下的 配置信息.ini。'
+            '3. 本产物由 GitHub Actions 自动构建，目标架构：${{ matrix.arch }}。'
+          ) | Set-Content -Path "$packageDir/使用说明.txt" -Encoding UTF8
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact-name }}
+          path: package/${{ matrix.artifact-name }}
+          if-no-files-found: error
