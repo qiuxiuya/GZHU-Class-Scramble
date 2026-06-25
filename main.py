@@ -392,23 +392,13 @@ def xuanke3(xuanke_data: dict):
 
 
 if __name__ == '__main__':
-    bannerstr = r"""
-
- _     ___ ____ _   _ _____ _   _  ___   ___  _  __
-| |   |_ _/ ___| | | |_   _| | | |/ _ \ / _ \| |/ /
-| |    | | |  _| |_| | | | | |_| | | | | | | | ' / 
-| |___ | | |_| |  _  | | | |  _  | |_| | |_| | . \ 
-|_____|___\____|_| |_| |_| |_| |_|\___/ \___/|_|\_\
-"""
     menustr = """
-    Course-Bullying-in-GZHU
     0:配置信息助手
     1:登录教务系统
     9:退出
 """
     while True:
         os.system('cls')
-        print(bannerstr)
         print(menustr)
         choice_menu = input('\n输入操作前面的数字标号，按回车确定 > ')
 

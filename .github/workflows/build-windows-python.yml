@@ -16,11 +16,6 @@ jobs:
             python-version: '3.10'
             runner: windows-latest
             artifact-name: Course-Bullying-in-GZHU-windows-amd64
-          - arch: arm64
-            python-arch: arm64
-            python-version: '3.10'
-            runner: windows-11-arm
-            artifact-name: Course-Bullying-in-GZHU-windows-arm64
 
     defaults:
       run:
