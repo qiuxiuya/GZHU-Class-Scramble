@@ -6,12 +6,17 @@ import threading
 import concurrent.futures
 from datetime import datetime
 
+from login_cache import login_with_cache
+
 
 # 跳过容量检查的板块列表，可在配置文件中用 skipcapacity 自定义（逗号分隔）
 SKIP_CAPACITY_BLOCKS = ['通识']
 
 # 请求间隔（秒），可在配置文件中用 requestinterval 自定义
 REQUEST_INTERVAL = 0.5
+
+# 课程信息缓存，key=(教学班号, 板块)
+COURSE_INFO_CACHE = {}
 
 
 class Config(object):
@@ -118,16 +123,23 @@ def print_data(data: list):
                                              kch=detail['kch_id'], msg=detail['msg']))
 
 
-def get_daixuan_info(xuanke_data: dict) -> list:
+def get_daixuan_info(xuanke_data: dict, refresh: bool = False) -> list:
     # 待选信息
     daixuan_info = []
     for key in xuanke_data:
         jxbh = xuanke_data[key][0]  # 教学班号
         block = xuanke_data[key][1]  # 板块
         priority = int(xuanke_data[key][2]) if len(xuanke_data[key]) > 2 else 1  # 优先级
+        cache_key = (jxbh, block)
+
+        if (not refresh) and cache_key in COURSE_INFO_CACHE:
+            cached_data = dict(COURSE_INFO_CACHE[cache_key])
+            cached_data.update({'priority': priority})
+            daixuan_info.append(cached_data)
+            continue
 
         search_data = g.search_kch(jxbh, block)
-        if len(search_data) != 0:
+        if search_data and len(search_data) != 0:
             # 不同教学班共用一个课程号，所以取第一个即可
             query_data = g.query_task(jxbh, search_data[0]['kch_id'], block)
 
@@ -147,8 +159,23 @@ def get_daixuan_info(xuanke_data: dict) -> list:
             # 这里发生了转换,sd的类型从list转为dict
             all_data = {}
             all_data.update(search_data[0])
-            all_data.update(query_data[0])
+            if query_data and len(query_data) != 0:
+                all_data.update(query_data[0])
+            else:
+                all_data.update({
+                    'do_jxb_id': '',
+                    'jsxx': '',
+                    'jxbrl': '',
+                    'success': False,
+                    'kklxdm': '',
+                    'xkkzid': '',
+                    'bklx_id': '',
+                    'rwlx': '',
+                    'xkly': '',
+                    'msg': '',
+                })
             all_data.update({'block': block, 'priority': priority})
+            COURSE_INFO_CACHE[cache_key] = dict(all_data)
             daixuan_info.append(all_data)
         else:
             search_data = {
@@ -170,6 +197,7 @@ def get_daixuan_info(xuanke_data: dict) -> list:
                 'msg': '',  # 存放后面选课返回的信息作为备注
                 'priority': priority,
             }
+            COURSE_INFO_CACHE[cache_key] = dict(search_data)
             daixuan_info.append(search_data)
     # [{'cousrse_name':"...",...},{...},...]
     return daixuan_info
@@ -377,7 +405,7 @@ def xuanke3(xuanke_data: dict):
 
             # 刷新新课容量信息
             tmp_new_refresh = {'1': [task['jxb_new'], task['block']]}
-            refreshed_new = get_daixuan_info(xuanke_data=tmp_new_refresh)
+            refreshed_new = get_daixuan_info(xuanke_data=tmp_new_refresh, refresh=True)
             if refreshed_new:
                 new_data = refreshed_new[0]
 
@@ -391,7 +419,7 @@ def xuanke3(xuanke_data: dict):
 
                 # 保留旧课的退课关键信息
                 tmp_old_refresh = {'1': [task['jxb_old'], task['block']]}
-                refreshed_old = get_daixuan_info(xuanke_data=tmp_old_refresh)
+                refreshed_old = get_daixuan_info(xuanke_data=tmp_old_refresh, refresh=True)
                 if refreshed_old:
                     old_data = refreshed_old[0]
 
@@ -469,9 +497,14 @@ if __name__ == '__main__':
             config = Config()
             print('正在登录教务系统中...')
             g = gzhu.GZHU(config.username, config.password)
-            if g.login():
+            login_ok, login_source = login_with_cache(g)
+            if login_ok:
                 # g.xuan_ke() 执行各种初始化操作，但这需要选课系统的开放。
                 print('\n登录成功!当前用户为{un}'.format(un=config.username))
+                if login_source == 'cache':
+                    print('已使用本地登录缓存')
+                else:
+                    print('已完成登录并更新本地缓存')
                 while True:
                     print('1：自动抢课\n2：捡漏模式\n3：替换模式\n99：返回主界面')
                     choice_xuanke = input('请输入选课模式,按回车确定 > ')
